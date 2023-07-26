@@ -1,4 +1,4 @@
-# ✴️ Whisper Kurdish
+# ☀️ Whisper Kurdish
 
 This repo contains code to finetune the Whisper model on Central Kurdish speech data. 
 

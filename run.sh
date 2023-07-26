@@ -1,0 +1,35 @@
+deepspeed finetune.py \
+    --deepspeed="ds_config.json" \
+	--model_name_or_path="openai/whisper-large-v2" \
+	--dataset_name="razhan/deng" \
+	--dataset_config_name="ckb" \
+	--language="kurdish" \
+	--model_index_name="Whisper Large Kurdish" \
+	--max_steps="7000" \
+	--output_dir="./whisper-large-kurdish" \
+	--per_device_train_batch_size="32" \
+	--per_device_eval_batch_size="16" \
+    --gradient_accumulation_steps="1" \
+	--logging_steps="25" \
+	--learning_rate="1e-5" \
+	--warmup_steps="500" \
+	--evaluation_strategy="steps" \
+	--eval_steps="1000" \
+	--save_strategy="steps" \
+	--save_steps="1000" \
+	--generation_max_length="225" \
+	--length_column_name="input_length" \
+	--max_duration_in_seconds="30" \
+	--freeze_feature_encoder="False" \
+	--report_to="tensorboard" \
+	--metric_for_best_model="wer" \
+	--greater_is_better="False" \
+	--load_best_model_at_end \
+	--gradient_checkpointing \
+	--fp16 \
+	--overwrite_output_dir \
+	--do_train \
+	--do_eval \
+	--predict_with_generate \
+	--use_auth_token \
+	--push_to_hub

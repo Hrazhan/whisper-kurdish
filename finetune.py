@@ -47,9 +47,8 @@ from transformers.utils.versions import require_version
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.25.0.dev0")
+check_min_version("4.30.0.dev0")
 
-require_version("datasets>=1.18.2", "To fix: pip install -r examples/pytorch/speech-recognition/requirements.txt")
 
 logger = logging.getLogger(__name__)
 
@@ -342,7 +341,7 @@ def main():
         processor.tokenizer.set_prefix_tokens(language=data_args.language, task=data_args.task)
 
 
-    # 7. Preprocessing the datasets.
+    # Preprocessing the datasets.
     # We need to read the audio files as arrays and tokenize the targets.
     max_input_length = data_args.max_duration_in_seconds * processor.feature_extractor.sampling_rate
     min_input_length = data_args.min_duration_in_seconds * processor.feature_extractor.sampling_rate
@@ -427,7 +426,7 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # 13. Evaluation
+    # Evaluation
     results = {}
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
@@ -442,7 +441,7 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-    # 14. Write Training Stats
+    # Write Training Stats
     kwargs = {
         "finetuned_from": model_args.model_name_or_path,
         "tasks": "automatic-speech-recognition",

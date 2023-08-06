@@ -1,4 +1,4 @@
-deepspeed train.py \
+deepspeed finetune.py \
     --deepspeed="ds_config.json" \
 	--model_name_or_path="openai/whisper-base" \
 	--tokenizer_name="razhan/whisper-kurdish" \

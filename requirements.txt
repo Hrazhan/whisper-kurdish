@@ -9,3 +9,4 @@ more-itertools
 tensorboard
 deepspeed
 accelerate
+klpt

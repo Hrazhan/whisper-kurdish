@@ -1,12 +1,18 @@
-deepspeed finetune.py \
+deepspeed train.py \
     --deepspeed="ds_config.json" \
-	--model_name_or_path="openai/whisper-large-v2" \
+	--model_name_or_path="openai/whisper-base" \
+	--tokenizer_name="razhan/whisper-kurdish" \
+	--feature_extractor_name="openai/whisper-base" \
 	--dataset_name="razhan/deng" \
 	--dataset_config_name="ckb" \
-	--language="kurdish" \
-	--model_index_name="Whisper Large Kurdish" \
-	--max_steps="7000" \
-	--output_dir="./whisper-large-kurdish" \
+	--train_split_name="train" \
+	--eval_split_name="test" \
+	--model_index_name="Whisper Base Kurdish" \
+	--max_steps="5000" \
+	--output_dir="./whisper-base-kurdish" \
+	--text_column_name="transcription" \
+	--audio_column_name="audio" \
+	--do_remove_punctuation \
 	--per_device_train_batch_size="32" \
 	--per_device_eval_batch_size="16" \
     --gradient_accumulation_steps="1" \
@@ -14,7 +20,7 @@ deepspeed finetune.py \
 	--learning_rate="1e-5" \
 	--warmup_steps="500" \
 	--evaluation_strategy="steps" \
-	--eval_steps="1000" \
+	--eval_steps="200" \
 	--save_strategy="steps" \
 	--save_steps="1000" \
 	--generation_max_length="225" \

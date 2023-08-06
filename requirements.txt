@@ -4,7 +4,7 @@ git+https://github.com/huggingface/transformers
 git+https://github.com/huggingface/datasets
 librosa
 jiwer
-evaluate>=0.3.0
+evaluate
 more-itertools
 tensorboard
 deepspeed

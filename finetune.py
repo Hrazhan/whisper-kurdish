@@ -13,7 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+"""
+Fine-tuning the library models for sequence to sequence speech recognition
+with 🤗 Datasets' streaming mode.
+"""
+# You can also adapt this script for your own sequence to sequence speech
+# recognition task. Pointers for this are left as comments.
 
 import logging
 import os
@@ -23,7 +28,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import datasets
 import torch
-from datasets import DatasetDict, load_dataset
+from datasets import DatasetDict, IterableDatasetDict, interleave_datasets, load_dataset
 from torch.utils.data import IterableDataset
 
 import evaluate
@@ -37,17 +42,23 @@ from transformers import (
     HfArgumentParser,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerCallback,
     set_seed,
 )
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from transformers.trainer_pt_utils import IterableDatasetShard
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
-from transformers.utils import check_min_version
+from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
+
+from klpt.preprocess import Preprocess
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.30.0.dev0")
+check_min_version("4.25.0.dev0")
+
+require_version("datasets>=1.18.2", "To fix: pip install -r examples/pytorch/speech-recognition/requirements.txt")
+
 
 
 logger = logging.getLogger(__name__)
@@ -60,19 +71,25 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
-        default="openai/whisper-large-v2", metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
-    processor_name: Optional[str] = field(
-        default="razhan/whisper-kurdish", metadata={"help": "Pretrained processor name or path if not the same as model_name"}
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    feature_extractor_name: Optional[str] = field(
+        default=None, metadata={"help": "feature extractor name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where to store the pretrained models downloaded from huggingface.co"},
     )
-
+    use_fast_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+    )
     model_revision: str = field(
         default="main",
         metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
@@ -120,7 +137,10 @@ class DataTrainingArguments:
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
-
+    text_column: Optional[str] = field(
+        default=None,
+        metadata={"help": "The name of the column in the datasets containing the full texts (for summarization)."},
+    )
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -139,7 +159,14 @@ class DataTrainingArguments:
             )
         },
     )
-
+    audio_column_name: str = field(
+        default="audio",
+        metadata={"help": "The name of the dataset column containing the audio data. Defaults to 'audio'"},
+    )
+    text_column_name: str = field(
+        default="text",
+        metadata={"help": "The name of the dataset column containing the text data. Defaults to 'text'"},
+    )
     max_duration_in_seconds: float = field(
         default=20.0,
         metadata={
@@ -164,6 +191,18 @@ class DataTrainingArguments:
             "help": "The name of the training data set split to use (via the datasets library). Defaults to 'train'"
         },
     )
+    do_lower_case: bool = field(
+        default=False,
+        metadata={"help": "Whether the target text should be lower cased."},
+    )
+    do_remove_punctuation: bool = field(
+        default=False,
+        metadata={"help": "Whether the target text should be striped of punctuation."},
+    )
+    do_normalize_eval: bool = field(
+        default=True,
+        metadata={"help": "Whether to normalise the references and predictions in the eval WER calculation."},
+    )
     language: str = field(
         default=None,
         metadata={
@@ -185,6 +224,10 @@ class DataTrainingArguments:
                 "the closer it is to real offline shuffling."
             )
         },
+    )
+    streaming: bool = field(
+        default=False,
+        metadata={"help": "Whether to use streaming mode to load and pre-process the data."},
     )
 
 
@@ -226,15 +269,46 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         return batch
 
 
+def load_maybe_streaming_dataset(dataset_name, dataset_config_name, split="train", streaming=True, **kwargs):
+    """
+    Utility function to load a dataset in streaming mode. For datasets with multiple splits,
+    each split is loaded individually and then splits combined by taking alternating examples from
+    each (interleaving).
+    """
+    if "+" in split:
+        # load multiple splits separated by the `+` symbol with streaming mode
+        dataset_splits = [
+            load_dataset(dataset_name, dataset_config_name, split=split_name, streaming=streaming, **kwargs)
+            for split_name in split.split("+")
+        ]
+        # interleave multiple splits to form one dataset
+        interleaved_dataset = interleave_datasets(dataset_splits)
+        return interleaved_dataset
+    else:
+        # load a single split *with* streaming mode
+        dataset = load_dataset(dataset_name, dataset_config_name, split=split, streaming=streaming, **kwargs)
+        return dataset
+
 
 def main():
-
+    # 1. Parse input arguments
+    # See all possible arguments in src/transformers/training_args.py
+    # or by passing the --help flag to this script.
+    # We now keep distinct sets of args, for a cleaner separation of concerns.
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
 
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # If we pass only one argument to the script and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
+    # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    send_example_telemetry("run_speech_recognition_seq2seq_streaming", model_args, data_args)
 
-    # Setup logging
+    # 2. Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -261,7 +335,7 @@ def main():
         transformers.utils.logging.set_verbosity_info()
     logger.info("Training/evaluation parameters %s", training_args)
 
-    # Detecting last checkpoint and eventually continue from last checkpoint
+    # 3. Detecting last checkpoint and eventually continue from last checkpoint
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
@@ -279,28 +353,44 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    # Load dataset
-    raw_datasets = DatasetDict()
+    # 4. Load dataset
+    raw_datasets = IterableDatasetDict() if data_args.streaming else DatasetDict()
 
     if training_args.do_train:
-        raw_datasets["train"] = load_dataset(
+        raw_datasets["train"] = load_maybe_streaming_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
             split=data_args.train_split_name,
             use_auth_token=True if model_args.use_auth_token else None,
+            streaming=data_args.streaming,
         )
 
     if training_args.do_eval:
-        raw_datasets["eval"] = load_dataset(
+        raw_datasets["eval"] = load_maybe_streaming_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
             split=data_args.eval_split_name,
             use_auth_token=True if model_args.use_auth_token else None,
+            streaming=data_args.streaming,
         )
 
-   
+    raw_datasets_features = list(next(iter(raw_datasets.values())).features.keys())
 
-    # Load pretrained model, tokenizer, and feature extractor
+    if data_args.audio_column_name not in raw_datasets_features:
+        raise ValueError(
+            f"--audio_column_name '{data_args.audio_column_name}' not found in dataset '{data_args.dataset_name}'. "
+            "Make sure to set `--audio_column_name` to the correct audio column - one of "
+            f"{', '.join(raw_datasets_features)}."
+        )
+
+    if data_args.text_column_name not in raw_datasets_features:
+        raise ValueError(
+            f"--text_column_name {data_args.text_column_name} not found in dataset '{data_args.dataset_name}'. "
+            "Make sure to set `--text_column_name` to the correct text column - one of "
+            f"{', '.join(raw_datasets_features)}."
+        )
+
+    # 5. Load pretrained model, tokenizer, and feature extractor
     #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
@@ -316,9 +406,19 @@ def main():
     if training_args.gradient_checkpointing:
         config.update({"use_cache": False})
 
-
-    processor = AutoProcessor.from_pretrained(model_args.processor_name)
-
+    feature_extractor = AutoFeatureExtractor.from_pretrained(
+        model_args.feature_extractor_name if model_args.feature_extractor_name else model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_args.model_name_or_path,
         config=config,
@@ -338,20 +438,69 @@ def main():
 
     if data_args.language is not None:
         # We only need to set the task id when the language is specified (i.e. in a multilingual setting)
-        processor.tokenizer.set_prefix_tokens(language=data_args.language, task=data_args.task)
+        tokenizer.set_prefix_tokens(language=data_args.language, task=data_args.task)
 
+    # 6. Resample speech dataset if necessary
+    dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
+    if dataset_sampling_rate != feature_extractor.sampling_rate:
+        raw_datasets = raw_datasets.cast_column(
+            data_args.audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
+        )
 
-    # Preprocessing the datasets.
+    # 7. Preprocessing the datasets.
     # We need to read the audio files as arrays and tokenize the targets.
-    max_input_length = data_args.max_duration_in_seconds * processor.feature_extractor.sampling_rate
-    min_input_length = data_args.min_duration_in_seconds * processor.feature_extractor.sampling_rate
+    max_input_length = data_args.max_duration_in_seconds * feature_extractor.sampling_rate
+    min_input_length = data_args.min_duration_in_seconds * feature_extractor.sampling_rate
+    audio_column_name = data_args.audio_column_name
+    text_column_name = data_args.text_column_name
+    model_input_name = feature_extractor.model_input_names[0]
+    do_lower_case = data_args.do_lower_case
+    do_remove_punctuation = data_args.do_remove_punctuation
+    normalizer = BasicTextNormalizer()  # 'official' text normalizer from OpenAI
 
-    model_input_name = processor.feature_extractor.model_input_names[0]
+    if data_args.max_train_samples is not None:
+        raw_datasets["train"] = (
+            raw_datasets["train"].take(data_args.max_train_samples)
+            if data_args.streaming
+            else raw_datasets["train"].select(range(data_args.max_train_samples))
+        )
 
+    if data_args.max_eval_samples is not None:
+        raw_datasets["eval"] = (
+            raw_datasets["eval"].take(data_args.max_eval_samples)
+            if data_args.streaming
+            else raw_datasets["eval"].select(range(data_args.max_eval_samples))
+        )
+    
+    preprocessor_ckb = Preprocess("Sorani", "Arabic", numeral="Latin")
 
+    def prepare_dataset(batch):
+        # process audio
+        sample = batch[audio_column_name]
+        inputs = feature_extractor(sample["array"], sampling_rate=sample["sampling_rate"])
+        # process audio length
+        batch[model_input_name] = inputs.get(model_input_name)[0]
+        batch["input_length"] = len(sample["array"])
 
+        # process targets
+        input_str = preprocessor_ckb.preprocess(batch[text_column_name])
+        if do_remove_punctuation:
+            input_str = normalizer(input_str).strip()
+        batch["labels"] = tokenizer(input_str).input_ids
+        return batch
 
-    vectorized_datasets = raw_datasets
+    with training_args.main_process_first(desc="dataset map pre-processing"):
+        vectorized_datasets = raw_datasets.map(
+            prepare_dataset,
+            remove_columns=raw_datasets_features,
+        ).with_format("torch")
+
+        if training_args.do_train and data_args.streaming:
+            # manually shuffle if streaming (done by the trainer for non-streaming)
+            vectorized_datasets["train"] = vectorized_datasets["train"].shuffle(
+                buffer_size=data_args.shuffle_buffer_size,
+                seed=training_args.seed,
+            )
 
     # filter training data that is shorter than min_input_length or longer than
     # max_input_length
@@ -364,39 +513,54 @@ def main():
             input_columns=["input_length"],
         )
 
-    # Load Metric
-    metric_wer = evaluate.load("wer")
-    metric_cer = evaluate.load("cer")
-
+    # 8. Load Metric
+    metric = evaluate.load("wer")
+    do_normalize_eval = data_args.do_normalize_eval
 
     def compute_metrics(pred):
         pred_ids = pred.predictions
 
-        pred.label_ids[pred.label_ids == -100] = processor.tokenizer.pad_token_id
+        pred.label_ids[pred.label_ids == -100] = tokenizer.pad_token_id
 
-        pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         # we do not want to group tokens when computing the metrics
-        label_str = processor.tokenizer.batch_decode(pred.label_ids, skip_special_tokens=True)
+        label_str = tokenizer.batch_decode(pred.label_ids, skip_special_tokens=True)
 
-        wer = 100 * metric_wer.compute(predictions=pred_str, references=label_str)
-        cer = 100 * metric_cer.compute(predictions=pred_str, references=label_str)
-        
-        return {
-            "wer": wer,
-            "cer": cer
-        }
+        if do_normalize_eval:
+            pred_str = [normalizer(pred) for pred in pred_str]
+            label_str = [normalizer(label) for label in label_str]
+            # filtering step to only evaluate the samples that correspond to non-zero references:
+            pred_str = [pred_str[i] for i in range(len(pred_str)) if len(label_str[i]) > 0]
+            label_str = [label_str[i] for i in range(len(label_str)) if len(label_str[i]) > 0]
 
+        wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+
+        return {"wer": wer}
+
+    # 9. Create a single speech processor
     if is_main_process(training_args.local_rank):
+        # save feature extractor, tokenizer and config
+        feature_extractor.save_pretrained(training_args.output_dir)
+        tokenizer.save_pretrained(training_args.output_dir)
         config.save_pretrained(training_args.output_dir)
 
+    processor = AutoProcessor.from_pretrained(training_args.output_dir)
 
-
+    # 10. Define data collator
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
         processor=processor,
         decoder_start_token_id=model.config.decoder_start_token_id,
     )
 
-
+    # 11. Configure Trainer
+    # Trainer callback to reinitialise and reshuffle the streamable datasets at the beginning of each epoch
+    # Only required for streaming: Trainer automatically shuffles non-streaming datasets
+    class ShuffleCallback(TrainerCallback):
+        def on_epoch_begin(self, args, state, control, train_dataloader, **kwargs):
+            if isinstance(train_dataloader.dataset, IterableDatasetShard):
+                pass  # set_epoch() is handled by the Trainer
+            elif isinstance(train_dataloader.dataset, IterableDataset):
+                train_dataloader.dataset.set_epoch(train_dataloader.dataset._epoch + 1)
 
     # Initialize Trainer
     trainer = Seq2SeqTrainer(
@@ -404,12 +568,13 @@ def main():
         args=training_args,
         train_dataset=vectorized_datasets["train"] if training_args.do_train else None,
         eval_dataset=vectorized_datasets["eval"] if training_args.do_eval else None,
-        tokenizer=processor.feature_extractor,
+        tokenizer=feature_extractor,
         data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+        callbacks=[ShuffleCallback()] if data_args.streaming else None,
     )
 
-    # Training
+    # 12. Training
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
@@ -426,7 +591,7 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
+    # 13. Evaluation
     results = {}
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
@@ -441,14 +606,22 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-    # Write Training Stats
+    # 14. Write Training Stats
     kwargs = {
         "finetuned_from": model_args.model_name_or_path,
         "tasks": "automatic-speech-recognition",
-        "tags": "kurdish",
+        "tags": "whisper-event",
     }
     if data_args.dataset_name is not None:
         kwargs["dataset_tags"] = data_args.dataset_name
+        if data_args.dataset_config_name is not None:
+            kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
+        else:
+            kwargs["dataset"] = data_args.dataset_name
+        if "common_voice" in data_args.dataset_name:
+            kwargs["language"] = data_args.dataset_config_name.split('-')[0]
+        if model_args.model_index_name is not None:
+            kwargs["model_name"] = model_args.model_index_name
 
     if training_args.push_to_hub:
         trainer.push_to_hub(**kwargs)

@@ -110,9 +110,6 @@ class ModelArguments:
     freeze_encoder: bool = field(
         default=False, metadata={"help": "Whether to freeze the entire encoder of the seq2seq model."}
     )
-    decoder_layerdrop : float = field(
-        default=0, metadata={"help": "Whether to train the decoder layer from scratch or nots."}
-    )
     forced_decoder_ids: List[List[int]] = field(
         default=None,
         metadata={
@@ -405,7 +402,7 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    config.update({"forced_decoder_ids": model_args.forced_decoder_ids, "suppress_tokens": model_args.suppress_tokens, "decoder_layerdrop": model_args.decoder_layerdrop})
+    config.update({"forced_decoder_ids": model_args.forced_decoder_ids, "suppress_tokens": model_args.suppress_tokens})
 
     if training_args.gradient_checkpointing:
         config.update({"use_cache": False})

@@ -52,6 +52,7 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 from klpt.preprocess import Preprocess
+from helpers import resolve_ae
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -108,6 +109,9 @@ class ModelArguments:
     )
     freeze_encoder: bool = field(
         default=False, metadata={"help": "Whether to freeze the entire encoder of the seq2seq model."}
+    )
+    decoder_layerdrop : float = field(
+        default=0, metadata={"help": "Whether to train the decoder layer from scratch or nots."}
     )
     forced_decoder_ids: List[List[int]] = field(
         default=None,
@@ -401,7 +405,7 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    config.update({"forced_decoder_ids": model_args.forced_decoder_ids, "suppress_tokens": model_args.suppress_tokens})
+    config.update({"forced_decoder_ids": model_args.forced_decoder_ids, "suppress_tokens": model_args.suppress_tokens, "decoder_layerdrop": model_args.decoder_layerdrop})
 
     if training_args.gradient_checkpointing:
         config.update({"use_cache": False})
@@ -483,7 +487,8 @@ def main():
         batch["input_length"] = len(sample["array"])
 
         # process targets
-        input_str = preprocessor_ckb.preprocess(batch[text_column_name])
+        
+        input_str = preprocessor_ckb.preprocess(resolve_ae(batch[text_column_name]))
         if do_remove_punctuation:
             input_str = normalizer(input_str).strip()
         batch["labels"] = tokenizer(input_str).input_ids

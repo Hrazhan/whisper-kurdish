@@ -9,7 +9,7 @@ parser.add_argument(
     type=str,
     help="Repo id to get the tokenizer & feature extraction from",
 )
-parser.add_argument("--dataset_name", default="deng", type=str, help="Dataset repo id")
+parser.add_argument("--dataset_name", default="dang", type=str, help="Dataset repo id")
 parser.add_argument("--sampling_rate", default=16000, type=int, help="Sampling rate")
 parser.add_argument("--private", default=False, type=bool, help="Private dataset")
 
@@ -50,7 +50,7 @@ raw_datasets["test"] = load_dataset(
 
 raw_datasets.push_to_hub(
     args.dataset_name,
-    num_shards={"train": 10, "test": 1},
-    max_shard_size="600MB",
+    num_shards={"train": 8, "test": 1},
+    # max_shard_size="900MB",
     private=args.private,
 )
